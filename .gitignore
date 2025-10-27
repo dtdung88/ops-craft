@@ -1,0 +1,15 @@
+node_modules/
+__pycache__/
+.env
+*.pyc
+.pytest_cache/
+coverage/
+htmlcov/
+tests.db
+.env.dev
+.env.staging
+venv/
+.env
+document/
+alembic.ini
+alembic/
