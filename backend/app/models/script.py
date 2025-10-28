@@ -1,6 +1,8 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Enum as SQLEnum
 from sqlalchemy.sql import func
-from app.db.base import Base
+from app.db.base_class import Base
+from sqlalchemy.orm import relationship
+from app.models.secret import script_secrets
 import enum
 
 class ScriptType(str, enum.Enum):
@@ -34,3 +36,10 @@ class Script(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     created_by = Column(String(255), nullable=False, default="system")
     updated_by = Column(String(255), nullable=False, default="system")
+    
+    secrets = relationship(
+        "Secret",
+        secondary=script_secrets,
+        backref="scripts",
+        lazy="dynamic"
+    )

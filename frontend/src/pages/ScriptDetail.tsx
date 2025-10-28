@@ -1,9 +1,25 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate } from 'react-router-dom';
-import { scriptApi, executionApi } from '../services/api';
+import { scriptApi, executionApi, secretsApi } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import '../styles/ScriptDetail.css';
+
+interface Secret {
+    id: number;
+    name: string;
+    description?: string;
+    created_at: string;
+}
+
+interface AuditLog {
+    id: number;
+    action: string;
+    accessed_by: string;
+    execution_id?: number;
+    script_id?: number;
+    timestamp: string;
+}
 
 const ScriptDetail: React.FC = () => {
     const { id } = useParams<{ id: string }>();
@@ -11,6 +27,9 @@ const ScriptDetail: React.FC = () => {
     const queryClient = useQueryClient();
     const { isOperator, isAdmin } = useAuth();
     const [showExecuteModal, setShowExecuteModal] = useState(false);
+    const [showSecretsModal, setShowSecretsModal] = useState(false);
+    const [showAuditModal, setShowAuditModal] = useState(false);
+    const [selectedSecretForAudit, setSelectedSecretForAudit] = useState<Secret | null>(null);
     const [parameters, setParameters] = useState('{}');
     const [showToast, setShowToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
@@ -20,6 +39,46 @@ const ScriptDetail: React.FC = () => {
             const response = await scriptApi.getById(Number(id));
             return response.data;
         },
+    });
+
+    // Fetch attached secrets
+    const { data: attachedSecrets, refetch: refetchSecrets } = useQuery({
+        queryKey: ['script-secrets', id],
+        queryFn: async () => {
+            const response = await fetch(`${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets`, {
+                headers: {
+                    'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+                }
+            });
+            return response.json();
+        },
+    });
+
+    // Fetch all available secrets
+    const { data: allSecrets } = useQuery({
+        queryKey: ['all-secrets'],
+        queryFn: async () => {
+            const response = await secretsApi.getAll();
+            return response.data;
+        },
+        enabled: showSecretsModal,
+    });
+
+    // Fetch audit logs for selected secret
+    const { data: auditLogs } = useQuery({
+        queryKey: ['secret-audit', selectedSecretForAudit?.id],
+        queryFn: async () => {
+            const response = await fetch(
+                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/secrets/${selectedSecretForAudit?.id}/audit-logs`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+                    }
+                }
+            );
+            return response.json();
+        },
+        enabled: !!selectedSecretForAudit,
     });
 
     const showNotification = (message: string, type: 'success' | 'error' | 'info') => {
@@ -54,6 +113,52 @@ const ScriptDetail: React.FC = () => {
         },
     });
 
+    const attachSecretMutation = useMutation({
+        mutationFn: async (secretId: number) => {
+            const response = await fetch(
+                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets/${secretId}`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+                    }
+                }
+            );
+            if (!response.ok) throw new Error('Failed to attach secret');
+            return response.json();
+        },
+        onSuccess: () => {
+            refetchSecrets();
+            showNotification('Secret attached successfully', 'success');
+        },
+        onError: () => {
+            showNotification('Failed to attach secret', 'error');
+        },
+    });
+
+    const detachSecretMutation = useMutation({
+        mutationFn: async (secretId: number) => {
+            const response = await fetch(
+                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets/${secretId}`,
+                {
+                    method: 'DELETE',
+                    headers: {
+                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
+                    }
+                }
+            );
+            if (!response.ok) throw new Error('Failed to detach secret');
+            return response.json();
+        },
+        onSuccess: () => {
+            refetchSecrets();
+            showNotification('Secret detached successfully', 'success');
+        },
+        onError: () => {
+            showNotification('Failed to detach secret', 'error');
+        },
+    });
+
     const handleDelete = () => {
         if (window.confirm('Are you sure you want to delete this script? This action cannot be undone.')) {
             deleteMutation.mutate();
@@ -69,13 +174,21 @@ const ScriptDetail: React.FC = () => {
         }
     };
 
+    const handleViewAudit = (secret: Secret) => {
+        setSelectedSecretForAudit(secret);
+        setShowAuditModal(true);
+    };
+
     if (isLoading) return <div className="loading">Loading script...</div>;
     if (error) return <div className="error">Error loading script: {(error as Error).message}</div>;
     if (!script) return <div className="error">Script not found</div>;
 
+    const availableSecrets = allSecrets?.filter(
+        (secret: Secret) => !attachedSecrets?.some((attached: Secret) => attached.id === secret.id)
+    ) || [];
+
     return (
         <div className="script-detail-container">
-            {/* Toast Notification */}
             {showToast && (
                 <div className={`toast toast-${showToast.type}`}>
                     {showToast.type === 'success' && '✓ '}
@@ -91,25 +204,20 @@ const ScriptDetail: React.FC = () => {
                 </button>
                 <div className="actions">
                     {(isOperator || isAdmin) && (
-                        <button
-                            className="btn-edit"
-                            onClick={() => navigate(`/scripts/${id}/edit`)}
-                        >
-                            ✏️ Edit
-                        </button>
+                        <>
+                            <button className="btn-edit" onClick={() => navigate(`/scripts/${id}/edit`)}>
+                                ✏️ Edit
+                            </button>
+                            <button className="btn-secrets" onClick={() => setShowSecretsModal(true)}>
+                                🔐 Manage Secrets
+                            </button>
+                        </>
                     )}
-                    <button
-                        className="btn-primary"
-                        onClick={() => setShowExecuteModal(true)}
-                    >
+                    <button className="btn-primary" onClick={() => setShowExecuteModal(true)}>
                         ▶ Execute
                     </button>
                     {(isOperator || isAdmin) && (
-                        <button
-                            className="btn-danger"
-                            onClick={handleDelete}
-                            disabled={deleteMutation.isPending}
-                        >
+                        <button className="btn-danger" onClick={handleDelete} disabled={deleteMutation.isPending}>
                             {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
                         </button>
                     )}
@@ -124,9 +232,7 @@ const ScriptDetail: React.FC = () => {
                     <span className={`badge status-${script.status}`}>{script.status}</span>
                 </div>
 
-                {script.description && (
-                    <p className="description">{script.description}</p>
-                )}
+                {script.description && <p className="description">{script.description}</p>}
 
                 {script.tags && script.tags.length > 0 && (
                     <div className="tags">
@@ -136,6 +242,42 @@ const ScriptDetail: React.FC = () => {
                     </div>
                 )}
             </div>
+
+            {/* Attached Secrets Section */}
+            {attachedSecrets && attachedSecrets.length > 0 && (
+                <div className="attached-secrets-section">
+                    <h3>🔐 Attached Secrets ({attachedSecrets.length})</h3>
+                    <div className="secrets-list">
+                        {attachedSecrets.map((secret: Secret) => (
+                            <div key={secret.id} className="secret-item">
+                                <span className="secret-name">🔑 {secret.name}</span>
+                                <span className="secret-desc">{secret.description}</span>
+                                <div className="secret-actions">
+                                    <button
+                                        className="btn-small-action"
+                                        onClick={() => handleViewAudit(secret)}
+                                        title="View audit logs"
+                                    >
+                                        📊 Audit
+                                    </button>
+                                    {(isOperator || isAdmin) && (
+                                        <button
+                                            className="btn-small-danger"
+                                            onClick={() => detachSecretMutation.mutate(secret.id)}
+                                            title="Detach secret"
+                                        >
+                                            ✕
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                    <p className="secret-notice">
+                        ℹ️ These secrets will be injected as environment variables during execution
+                    </p>
+                </div>
+            )}
 
             <div className="script-content">
                 <h3>Script Content</h3>
@@ -153,6 +295,7 @@ const ScriptDetail: React.FC = () => {
                 </div>
             )}
 
+            {/* Execute Modal */}
             {showExecuteModal && (
                 <div className="modal-overlay" onClick={() => setShowExecuteModal(false)}>
                     <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -167,10 +310,7 @@ const ScriptDetail: React.FC = () => {
                             />
                         </div>
                         <div className="modal-actions">
-                            <button
-                                className="btn-secondary"
-                                onClick={() => setShowExecuteModal(false)}
-                            >
+                            <button className="btn-secondary" onClick={() => setShowExecuteModal(false)}>
                                 Cancel
                             </button>
                             <button
@@ -180,6 +320,83 @@ const ScriptDetail: React.FC = () => {
                             >
                                 {executeMutation.isPending ? 'Executing...' : 'Execute'}
                             </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Manage Secrets Modal */}
+            {showSecretsModal && (
+                <div className="modal-overlay" onClick={() => setShowSecretsModal(false)}>
+                    <div className="modal-large" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h2>Manage Secrets</h2>
+                            <button className="btn-close" onClick={() => setShowSecretsModal(false)}>×</button>
+                        </div>
+                        <div className="modal-body">
+                            <h3>Available Secrets</h3>
+                            {availableSecrets.length === 0 ? (
+                                <p>All secrets are already attached or no secrets available.</p>
+                            ) : (
+                                <div className="secrets-grid">
+                                    {availableSecrets.map((secret: Secret) => (
+                                        <div key={secret.id} className="secret-card-attach">
+                                            <div>
+                                                <strong>🔑 {secret.name}</strong>
+                                                {secret.description && <p>{secret.description}</p>}
+                                            </div>
+                                            <button
+                                                className="btn-attach"
+                                                onClick={() => attachSecretMutation.mutate(secret.id)}
+                                            >
+                                                + Attach
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Audit Logs Modal */}
+            {showAuditModal && selectedSecretForAudit && (
+                <div className="modal-overlay" onClick={() => { setShowAuditModal(false); setSelectedSecretForAudit(null); }}>
+                    <div className="modal-large" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h2>Audit Logs: {selectedSecretForAudit.name}</h2>
+                            <button className="btn-close" onClick={() => { setShowAuditModal(false); setSelectedSecretForAudit(null); }}>×</button>
+                        </div>
+                        <div className="modal-body">
+                            {auditLogs && auditLogs.length > 0 ? (
+                                <table className="audit-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Action</th>
+                                            <th>User</th>
+                                            <th>Execution ID</th>
+                                            <th>Timestamp</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {auditLogs.map((log: AuditLog) => (
+                                            <tr key={log.id}>
+                                                <td>
+                                                    <span className={`audit-action audit-${log.action}`}>
+                                                        {log.action}
+                                                    </span>
+                                                </td>
+                                                <td>{log.accessed_by}</td>
+                                                <td>{log.execution_id || '-'}</td>
+                                                <td>{new Date(log.timestamp).toLocaleString()}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            ) : (
+                                <p>No audit logs available for this secret.</p>
+                            )}
                         </div>
                     </div>
                 </div>

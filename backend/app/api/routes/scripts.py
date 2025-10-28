@@ -3,6 +3,10 @@ from sqlalchemy.orm import Session
 from typing import List
 from app.db.session import get_db
 from app.models.script import Script
+from app.models.secret import Secret
+from app.models.user import User
+from app.api.dependencies import get_db, require_operator, get_current_user
+from app.services.SecretService import SecretService
 from app.schemas.script import ScriptCreate, ScriptResponse, ScriptUpdate
 
 router = APIRouter()
@@ -129,3 +133,87 @@ def delete_script(
     db.delete(script)
     db.commit()
     return None
+
+@router.post("/{script_id}/secrets/{secret_id}")
+async def attach_secret_to_script(
+    script_id: int,
+    secret_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_operator)
+):
+    """Attach a secret to a script"""
+    script = db.query(Script).filter(Script.id == script_id).first()
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    
+    # Check if already attached
+    if secret in script.secrets.all():
+        raise HTTPException(status_code=400, detail="Secret already attached to script")
+    
+    script.secrets.append(secret)
+    db.commit()
+    
+    # Log the attachment
+    SecretService.log_access(
+        db=db,
+        secret=secret,
+        action="attached_to_script",
+        user_id=current_user.id,
+        username=current_user.username,
+        script_id=script_id
+    )
+    
+    return {"message": "Secret attached successfully"}
+
+
+@router.delete("/{script_id}/secrets/{secret_id}")
+async def detach_secret_from_script(
+    script_id: int,
+    secret_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_operator)
+):
+    """Detach a secret from a script"""
+    script = db.query(Script).filter(Script.id == script_id).first()
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+    
+    if secret not in script.secrets.all():
+        raise HTTPException(status_code=400, detail="Secret not attached to script")
+    
+    script.secrets.remove(secret)
+    db.commit()
+    
+    return {"message": "Secret detached successfully"}
+
+
+@router.get("/{script_id}/secrets")
+async def get_script_secrets(
+    script_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all secrets attached to a script"""
+    script = db.query(Script).filter(Script.id == script_id).first()
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    
+    secrets = [
+        {
+            "id": secret.id,
+            "name": secret.name,
+            "description": secret.description,
+            "created_at": secret.created_at
+        }
+        for secret in script.secrets.all()
+    ]
+    
+    return secrets

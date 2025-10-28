@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
 
-from app.api.dependencies import get_db, get_current_user, require_admin
+from app.api.dependencies import get_db, require_admin
 from app.models.user import User, UserRole
 from app.schemas.user import UserResponse, UserCreate, UserUpdate
 from app.core.security import get_password_hash

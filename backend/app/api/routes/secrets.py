@@ -2,12 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
-from pydantic import BaseModel
 
-from app.api.dependencies import get_db, require_operator
+from app.api.dependencies import get_db, require_operator, require_admin
 from app.models.user import User
 from app.models.secret import Secret
 from app.core.encryption import encryption_service
+from app.services.SecretService import SecretService
 from app.schemas.secret import SecretCreate, SecretUpdate, SecretResponse, SecretWithValue
 
 router = APIRouter()
@@ -164,3 +164,51 @@ async def get_secret_by_name(
         **secret.__dict__,
         "value": decrypted_value
     }
+
+@router.get("/audit-logs")
+async def get_all_audit_logs(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)
+):
+    """Get all secret audit logs (Admin only)"""
+    logs = SecretService.get_audit_logs(db=db, limit=limit)
+    
+    return [
+        {
+            "id": log.id,
+            "secret_name": log.secret_name,
+            "action": log.action,
+            "accessed_by": log.accessed_by_username,
+            "execution_id": log.execution_id,
+            "script_id": log.script_id,
+            "timestamp": log.timestamp
+        }
+        for log in logs
+    ]
+
+@router.get("/{secret_id}/audit-logs")
+async def get_secret_audit_logs(
+    secret_id: int,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_operator)
+):
+    """Get audit logs for a specific secret"""
+    secret = db.query(Secret).filter(Secret.id == secret_id).first()
+    if not secret:
+        raise HTTPException(status_code=404, detail="Secret not found")
+
+    logs = SecretService.get_audit_logs(db=db, secret_id=secret_id, limit=limit)
+
+    return [
+        {
+            "id": log.id,
+            "action": log.action,
+            "accessed_by": log.accessed_by_username,
+            "execution_id": log.execution_id,
+            "script_id": log.script_id,
+            "timestamp": log.timestamp
+        }
+        for log in logs
+    ]

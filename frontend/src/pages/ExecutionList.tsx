@@ -222,7 +222,7 @@ const ExecutionList: React.FC = () => {
                                     >
                                         📄 View Details
                                     </button>
-                                    {execution.status === 'running' && (
+                                    {(execution.status === 'running' || execution.status === 'pending') && (
                                         <button
                                             className="btn-small btn-cancel"
                                             onClick={() => handleCancelExecution(execution.id)}

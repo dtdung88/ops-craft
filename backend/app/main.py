@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from app.core.config import settings
 from app.api.routes import scripts, executions, auth, health, websocket, admin, secrets
 from app.db.session import engine
-from app.db.base import Base
+from app.db.base_class import Base
 
 
 @asynccontextmanager

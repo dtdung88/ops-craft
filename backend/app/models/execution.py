@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Enum as SQLEnum
 from sqlalchemy.sql import func
-from app.db.base import Base
+from app.db.base_class import Base
 import enum
 
 class ExecutionStatus(str, enum.Enum):

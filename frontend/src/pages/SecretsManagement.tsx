@@ -188,9 +188,6 @@ const SecretsManagement: React.FC = () => {
                     <div className="modal" onClick={(e) => e.stopPropagation()}>
                         <div className="modal-header">
                             <h2>Create New Secret</h2>
-                            <button className="btn-close" onClick={() => setShowCreateModal(false)}>
-                                ×
-                            </button>
                         </div>
 
                         <div className="modal-body">
