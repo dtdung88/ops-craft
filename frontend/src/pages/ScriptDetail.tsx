@@ -15,7 +15,8 @@ interface Secret {
 interface AuditLog {
     id: number;
     action: string;
-    accessed_by: string;
+    accessed_by: number;
+    accessed_by_username: string;
     execution_id?: number;
     script_id?: number;
     timestamp: string;
@@ -41,20 +42,14 @@ const ScriptDetail: React.FC = () => {
         },
     });
 
-    // Fetch attached secrets
     const { data: attachedSecrets, refetch: refetchSecrets } = useQuery({
         queryKey: ['script-secrets', id],
         queryFn: async () => {
-            const response = await fetch(`${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets`, {
-                headers: {
-                    'Authorization': `Bearer ${localStorage.getItem('access_token')}`
-                }
-            });
-            return response.json();
+            const response = await scriptApi.getSecrets(Number(id));
+            return response.data;
         },
     });
 
-    // Fetch all available secrets
     const { data: allSecrets } = useQuery({
         queryKey: ['all-secrets'],
         queryFn: async () => {
@@ -64,19 +59,12 @@ const ScriptDetail: React.FC = () => {
         enabled: showSecretsModal,
     });
 
-    // Fetch audit logs for selected secret
     const { data: auditLogs } = useQuery({
         queryKey: ['secret-audit', selectedSecretForAudit?.id],
         queryFn: async () => {
-            const response = await fetch(
-                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/secrets/${selectedSecretForAudit?.id}/audit-logs`,
-                {
-                    headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
-                    }
-                }
-            );
-            return response.json();
+            if (!selectedSecretForAudit?.id) return [];
+            const response = await secretsApi.getAuditLogs(selectedSecretForAudit.id);
+            return response.data;
         },
         enabled: !!selectedSecretForAudit,
     });
@@ -115,17 +103,7 @@ const ScriptDetail: React.FC = () => {
 
     const attachSecretMutation = useMutation({
         mutationFn: async (secretId: number) => {
-            const response = await fetch(
-                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets/${secretId}`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
-                    }
-                }
-            );
-            if (!response.ok) throw new Error('Failed to attach secret');
-            return response.json();
+            return scriptApi.attachSecret(Number(id), secretId);
         },
         onSuccess: () => {
             refetchSecrets();
@@ -138,17 +116,7 @@ const ScriptDetail: React.FC = () => {
 
     const detachSecretMutation = useMutation({
         mutationFn: async (secretId: number) => {
-            const response = await fetch(
-                `${process.env.REACT_APP_API_URL || 'http://localhost:8000/api/v1'}/scripts/${id}/secrets/${secretId}`,
-                {
-                    method: 'DELETE',
-                    headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('access_token')}`
-                    }
-                }
-            );
-            if (!response.ok) throw new Error('Failed to detach secret');
-            return response.json();
+            return scriptApi.detachSecret(Number(id), secretId);
         },
         onSuccess: () => {
             refetchSecrets();
@@ -177,6 +145,11 @@ const ScriptDetail: React.FC = () => {
     const handleViewAudit = (secret: Secret) => {
         setSelectedSecretForAudit(secret);
         setShowAuditModal(true);
+    };
+
+    const handleCloseAuditModal = () => {
+        setShowAuditModal(false);
+        setTimeout(() => setSelectedSecretForAudit(null), 300);
     };
 
     if (isLoading) return <div className="loading">Loading script...</div>;
@@ -243,7 +216,6 @@ const ScriptDetail: React.FC = () => {
                 )}
             </div>
 
-            {/* Attached Secrets Section */}
             {attachedSecrets && attachedSecrets.length > 0 && (
                 <div className="attached-secrets-section">
                     <h3>🔐 Attached Secrets ({attachedSecrets.length})</h3>
@@ -299,15 +271,26 @@ const ScriptDetail: React.FC = () => {
             {showExecuteModal && (
                 <div className="modal-overlay" onClick={() => setShowExecuteModal(false)}>
                     <div className="modal" onClick={(e) => e.stopPropagation()}>
-                        <h2>Execute Script</h2>
-                        <div className="form-group">
-                            <label>Parameters (JSON):</label>
-                            <textarea
-                                value={parameters}
-                                onChange={(e) => setParameters(e.target.value)}
-                                rows={10}
-                                placeholder='{"key": "value"}'
-                            />
+                        <div className="modal-header">
+                            <h2>Execute Script</h2>
+                            <button
+                                className="modal-close"
+                                onClick={() => setShowExecuteModal(false)}
+                                aria-label="Close modal"
+                            >
+                                ×
+                            </button>
+                        </div>
+                        <div className="modal-body">
+                            <div className="form-group">
+                                <label>Parameters (JSON):</label>
+                                <textarea
+                                    value={parameters}
+                                    onChange={(e) => setParameters(e.target.value)}
+                                    rows={10}
+                                    placeholder='{"key": "value"}'
+                                />
+                            </div>
                         </div>
                         <div className="modal-actions">
                             <button className="btn-secondary" onClick={() => setShowExecuteModal(false)}>
@@ -330,24 +313,33 @@ const ScriptDetail: React.FC = () => {
                 <div className="modal-overlay" onClick={() => setShowSecretsModal(false)}>
                     <div className="modal-large" onClick={(e) => e.stopPropagation()}>
                         <div className="modal-header">
-                            <h2>Manage Secrets</h2>
-                            <button className="btn-close" onClick={() => setShowSecretsModal(false)}>×</button>
+                            <h2>🔐 Manage Secrets</h2>
+                            <button
+                                className="modal-close"
+                                onClick={() => setShowSecretsModal(false)}
+                                aria-label="Close modal"
+                            >
+                                ×
+                            </button>
                         </div>
                         <div className="modal-body">
                             <h3>Available Secrets</h3>
                             {availableSecrets.length === 0 ? (
-                                <p>All secrets are already attached or no secrets available.</p>
+                                <div className="modal-empty-state">
+                                    <p>All secrets are already attached or no secrets available.</p>
+                                </div>
                             ) : (
                                 <div className="secrets-grid">
                                     {availableSecrets.map((secret: Secret) => (
                                         <div key={secret.id} className="secret-card-attach">
-                                            <div>
+                                            <div className="secret-card-content">
                                                 <strong>🔑 {secret.name}</strong>
                                                 {secret.description && <p>{secret.description}</p>}
                                             </div>
                                             <button
                                                 className="btn-attach"
                                                 onClick={() => attachSecretMutation.mutate(secret.id)}
+                                                disabled={attachSecretMutation.isPending}
                                             >
                                                 + Attach
                                             </button>
@@ -362,11 +354,17 @@ const ScriptDetail: React.FC = () => {
 
             {/* Audit Logs Modal */}
             {showAuditModal && selectedSecretForAudit && (
-                <div className="modal-overlay" onClick={() => { setShowAuditModal(false); setSelectedSecretForAudit(null); }}>
+                <div className="modal-overlay" onClick={handleCloseAuditModal}>
                     <div className="modal-large" onClick={(e) => e.stopPropagation()}>
                         <div className="modal-header">
-                            <h2>Audit Logs: {selectedSecretForAudit.name}</h2>
-                            <button className="btn-close" onClick={() => { setShowAuditModal(false); setSelectedSecretForAudit(null); }}>×</button>
+                            <h2>📊 Audit Logs: {selectedSecretForAudit.name}</h2>
+                            <button
+                                className="modal-close"
+                                onClick={handleCloseAuditModal}
+                                aria-label="Close modal"
+                            >
+                                ×
+                            </button>
                         </div>
                         <div className="modal-body">
                             {auditLogs && auditLogs.length > 0 ? (
@@ -383,8 +381,8 @@ const ScriptDetail: React.FC = () => {
                                         {auditLogs.map((log: AuditLog) => (
                                             <tr key={log.id}>
                                                 <td>
-                                                    <span className={`audit-action audit-${log.action}`}>
-                                                        {log.action}
+                                                    <span className={`audit-action audit-${log.action.toLowerCase().replace(/_/g, '_')}`}>
+                                                        {log.action.replace(/_/g, ' ')}
                                                     </span>
                                                 </td>
                                                 <td>{log.accessed_by}</td>
@@ -395,7 +393,9 @@ const ScriptDetail: React.FC = () => {
                                     </tbody>
                                 </table>
                             ) : (
-                                <p>No audit logs available for this secret.</p>
+                                <div className="modal-empty-state">
+                                    <p>No audit logs available for this secret.</p>
+                                </div>
                             )}
                         </div>
                     </div>

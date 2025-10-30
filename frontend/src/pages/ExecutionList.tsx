@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { executionApi, getWebSocketUrl, Execution } from '../services/api';
 import { useWebSocket, WebSocketMessage } from '../hooks/useWebSockets';
@@ -24,28 +24,51 @@ const ExecutionList: React.FC = () => {
         refetchInterval: 5000,
     });
 
-    // WebSocket connection for live logs
-    const wsUrl = selectedExecution ? getWebSocketUrl(selectedExecution.id) : null;
+    // Create stable WebSocket URL using useMemo
+    const wsUrl = useMemo(() => {
+        if (!selectedExecution) return null;
+        return getWebSocketUrl(selectedExecution.id);
+    }, [selectedExecution?.id]); // Only recreate when execution ID changes
 
+    // Keep track of execution ID to prevent reconnections
+    const currentExecutionIdRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        if (selectedExecution && selectedExecution.id !== currentExecutionIdRef.current) {
+            currentExecutionIdRef.current = selectedExecution.id;
+
+            // Initialize log with existing output
+            const initialLog = selectedExecution.output || '';
+            setLiveLog(initialLog);
+        }
+    }, [selectedExecution?.id]);
+
+    // WebSocket connection
     const { isConnected } = useWebSocket(wsUrl, {
         onMessage: (message: WebSocketMessage) => {
-            if (executionIdRef.current !== selectedExecution?.id) return;
+            // Only process messages for current execution
+            if (currentExecutionIdRef.current !== selectedExecution?.id) {
+                return;
+            }
+
+            console.log('[WS-RECEIVED]', message.type, message.log_type);
 
             if (message.type === 'log' && message.content) {
                 setLiveLog((prev) => prev + message.content);
             } else if (message.type === 'status' && message.status) {
-                // Fetch updated execution details when status changes
-                fetchExecutionDetails(executionIdRef.current!);
+                // Fetch updated execution details
+                fetchExecutionDetails(currentExecutionIdRef.current!);
                 refetch();
             }
         },
         onOpen: () => {
             console.log('WebSocket connected for execution:', selectedExecution?.id);
-            setWsConnected(true);
         },
         onClose: () => {
             console.log('WebSocket disconnected');
-            setWsConnected(false);
+        },
+        onError: (error) => {
+            console.error('WebSocket error:', error);
         },
     });
 

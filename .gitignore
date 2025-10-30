@@ -13,3 +13,4 @@ venv/
 document/
 alembic.ini
 alembic/
+misc/
