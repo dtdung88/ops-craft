@@ -1,16 +1,22 @@
+"""
+Celery executor with Docker sandboxing and Redis streaming for ALL script types
+File: backend/app/tasks/executor.py
+"""
 import os
-import sys
-import asyncio
-import subprocess
+import docker
+import tempfile
 import threading
 import logging
+import shutil
 from celery import Celery
+from datetime import datetime, timezone
+
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.models.script import Script
+from app.models.script import Script, ScriptType
 from app.models.execution import ExecutionStatus, Execution
 from app.services.SecretService import SecretService
-from datetime import datetime, timezone
+from app.core.websocket_bridge import websocket_bridge
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -18,54 +24,37 @@ logger = logging.getLogger(__name__)
 
 celery_app = Celery("tasks", broker=settings.CELERY_BROKER_URL, backend=settings.CELERY_RESULT_BACKEND)
 
+# Docker client
+try:
+    docker_client = docker.from_env()
+    docker_client.ping()
+    logger.info("[DOCKER] Connected successfully")
+except Exception as e:
+    logger.error(f"[DOCKER] Failed to connect: {e}")
+    docker_client = None
 
-def send_websocket_log_sync(execution_id: int, log_type: str, content: str):
-    """Synchronous wrapper to send WebSocket logs"""
+
+def send_log(execution_id: int, log_type: str, content: str):
+    """Send log via Redis"""
     try:
-        logger.info(f"[WS-LOG] Execution {execution_id}, Type: {log_type}, Content: {content[:50]}...")
-        
-        # Import here to avoid circular imports
-        from app.api.routes.websocket import manager
-        
-        # Create new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            loop.run_until_complete(manager.broadcast_log(execution_id, log_type, content))
-            logger.info(f"[WS-LOG] Successfully sent to execution {execution_id}")
-        finally:
-            loop.close()
-            
+        websocket_bridge.publish_log(execution_id, log_type, content)
     except Exception as e:
-        logger.error(f"[WS-LOG] Failed to send WebSocket log: {e}", exc_info=True)
+        logger.error(f"[REDIS-LOG] Error: {e}")
 
 
-def send_websocket_status_sync(execution_id: int, status: str, metadata: dict = None):
-    """Synchronous wrapper to send WebSocket status"""
+def send_status(execution_id: int, status: str, metadata: dict = None):
+    """Send status via Redis"""
     try:
-        logger.info(f"[WS-STATUS] Execution {execution_id}, Status: {status}")
-        
-        from app.api.routes.websocket import manager
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            loop.run_until_complete(manager.broadcast_status(execution_id, status, metadata))
-            logger.info(f"[WS-STATUS] Successfully sent to execution {execution_id}")
-        finally:
-            loop.close()
-            
+        websocket_bridge.publish_status(execution_id, status, metadata)
     except Exception as e:
-        logger.error(f"[WS-STATUS] Failed to send WebSocket status: {e}", exc_info=True)
+        logger.error(f"[REDIS-STATUS] Error: {e}")
 
 
 @celery_app.task
 def execute_script_task(execution_id: int):
-    """Celery task to execute a script with real-time WebSocket streaming."""
+    """Execute script with Docker sandboxing and real-time streaming"""
     
-    logger.info(f"[TASK] Starting execution task for ID: {execution_id}")
+    logger.info(f"[TASK] Starting execution {execution_id}")
     
     db = SessionLocal()
     
@@ -77,22 +66,22 @@ def execute_script_task(execution_id: int):
         
         script = db.query(Script).filter(Script.id == execution.script_id).first()
         if not script:
-            logger.error(f"[TASK] Script {execution.script_id} not found")
             execution.status = ExecutionStatus.FAILED
             execution.error = "Script not found"
             db.commit()
             return
         
-        logger.info(f"[TASK] Executing script: {script.name} (ID: {script.id})")
+        logger.info(f"[TASK] Executing: {script.name} (type: {script.script_type})")
         
-        # Update status to running
+        # Update to running
         execution.status = ExecutionStatus.RUNNING
         execution.started_at = datetime.now(timezone.utc)
         db.commit()
         
-        # Send initial status
-        send_websocket_status_sync(execution.id, "running", {"started_at": execution.started_at.isoformat()})
-        send_websocket_log_sync(execution.id, "info", f"🚀 Starting execution of script: {script.name}\n")
+        # Send initial messages
+        send_status(execution.id, "running", {"started_at": execution.started_at.isoformat()})
+        send_log(execution.id, "info", f"🚀 Starting: {script.name}\n")
+        send_log(execution.id, "info", f"📝 Type: {script.script_type}\n")
         
         # Get secrets
         secrets_dict = SecretService.get_secrets_for_script(
@@ -104,192 +93,404 @@ def execute_script_task(execution_id: int):
         )
         
         if secrets_dict:
-            logger.info(f"[TASK] Injected {len(secrets_dict)} secrets")
-            send_websocket_log_sync(execution.id, "info", f"🔐 Injected {len(secrets_dict)} secret(s)\n")
+            send_log(execution.id, "info", f"🔐 Injected {len(secrets_dict)} secret(s)\n")
         
         # Prepare environment
-        env_vars = os.environ.copy()
+        env_vars = {}
         if execution.parameters:
             for key, value in execution.parameters.items():
                 env_vars[key] = str(value) if not isinstance(value, str) else value
         env_vars.update(secrets_dict or {})
         
-        # Execute
+        # Execute based on script type
         try:
-            send_websocket_log_sync(execution.id, "info", f"⚙️  Executing {script.script_type} script...\n")
-            send_websocket_log_sync(execution.id, "info", "─" * 50 + "\n")
+            send_log(execution.id, "info", f"⚙️  Executing {script.script_type} script in Docker...\n")
+            send_log(execution.id, "info", "─" * 50 + "\n")
             
-            logger.info(f"[TASK] Starting script execution...")
+            # Route to appropriate executor
+            if script.script_type == ScriptType.BASH:
+                exit_code, stdout, stderr = execute_bash_docker(
+                    script.content, env_vars, execution.id
+                )
+            elif script.script_type == ScriptType.PYTHON:
+                exit_code, stdout, stderr = execute_python_docker(
+                    script.content, env_vars, execution.id
+                )
+            elif script.script_type == ScriptType.ANSIBLE:
+                exit_code, stdout, stderr = execute_ansible_docker(
+                    script.content, env_vars, execution.id
+                )
+            elif script.script_type == ScriptType.TERRAFORM:
+                exit_code, stdout, stderr = execute_terraform_docker(
+                    script.content, env_vars, execution.id
+                )
+            else:
+                send_log(execution.id, "error", f"❌ Unsupported script type: {script.script_type}\n")
+                exit_code = 1
+                stdout = ""
+                stderr = f"Unsupported script type: {script.script_type}"
             
-            exit_code, stdout, stderr = execute_bash_with_streaming(
-                script_content=script.content,
-                env_vars=env_vars,
-                execution_id=execution.id,
-                timeout=300
-            )
-            
-            logger.info(f"[TASK] Script completed with exit code: {exit_code}")
-            
-            send_websocket_log_sync(execution.id, "info", "─" * 50 + "\n")
+            send_log(execution.id, "info", "\n" + "─" * 50 + "\n")
             
             execution.output = stdout
             execution.error = stderr if exit_code != 0 else None
             execution.status = ExecutionStatus.SUCCESS if exit_code == 0 else ExecutionStatus.FAILED
             
             if exit_code == 0:
-                send_websocket_log_sync(execution.id, "info", f"✅ Execution completed successfully\n")
+                send_log(execution.id, "info", "✅ Completed successfully\n")
             else:
-                send_websocket_log_sync(execution.id, "error", f"❌ Execution failed (exit code: {exit_code})\n")
+                send_log(execution.id, "error", f"❌ Failed (exit code: {exit_code})\n")
             
         except Exception as e:
-            logger.error(f"[TASK] Execution error: {e}", exc_info=True)
+            logger.error(f"[TASK] Error: {e}", exc_info=True)
             execution.status = ExecutionStatus.FAILED
-            execution.error = f"Execution error: {str(e)}"
-            execution.output = None
-            send_websocket_log_sync(execution.id, "error", f"❌ Error: {str(e)}\n")
+            execution.error = str(e)
+            send_log(execution.id, "error", f"❌ Error: {str(e)}\n")
         
         execution.completed_at = datetime.now(timezone.utc)
         db.commit()
         
-        # Send final status
-        send_websocket_status_sync(
-            execution.id, 
-            execution.status.value,
-            {"completed_at": execution.completed_at.isoformat()}
-        )
+        send_status(execution.id, execution.status.value, {
+            "completed_at": execution.completed_at.isoformat()
+        })
         
-        logger.info(f"[TASK] Task completed for execution {execution_id}")
+        logger.info(f"[TASK] Completed execution {execution_id}")
         
     except Exception as e:
         logger.error(f"[TASK] Fatal error: {e}", exc_info=True)
-        if execution:
-            execution.status = ExecutionStatus.FAILED
-            execution.error = f"Task error: {str(e)}"
-            execution.completed_at = datetime.now(timezone.utc)
-            db.commit()
-        
     finally:
         db.close()
 
 
-def execute_bash_with_streaming(script_content: str, env_vars: dict, execution_id: int, timeout: int = 300):
-    """Execute bash script with real-time streaming output"""
-    import tempfile
-    
-    logger.info(f"[EXEC] Creating temporary script file...")
-    
-    # Create temp script
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-        f.write(script_content)
-        script_path = f.name
-    
-    logger.info(f"[EXEC] Script path: {script_path}")
+def stream_docker_logs(container, execution_id: int):
+    """Stream Docker container logs in real-time"""
+    stdout_lines = []
+    stderr_lines = []
     
     try:
-        os.chmod(script_path, 0o755)
+        # Stream logs in real-time
+        for log_chunk in container.logs(stream=True, follow=True, stdout=True, stderr=True):
+            line = log_chunk.decode('utf-8', errors='replace')
+            
+            # Detect if it's an error (simple heuristic)
+            is_error = any(word in line.lower() for word in ['error', 'fail', 'exception', 'traceback'])
+            
+            if is_error:
+                stderr_lines.append(line)
+                send_log(execution_id, "stderr", line)
+            else:
+                stdout_lines.append(line)
+                send_log(execution_id, "stdout", line)
+            
+    except Exception as e:
+        logger.error(f"[DOCKER-STREAM] Error: {e}")
+    
+    return ''.join(stdout_lines), ''.join(stderr_lines)
+
+
+def execute_bash_docker(script_content: str, env_vars: dict, execution_id: int):
+    """Execute bash script in Alpine Docker container with streaming"""
+    
+    if not docker_client:
+        send_log(execution_id, "error", "❌ Docker not available\n")
+        return 1, "", "Docker not available"
+    
+    try:
+        send_log(execution_id, "info", "🐳 Starting Alpine container...\n")
         
-        logger.info(f"[EXEC] Starting subprocess...")
-        
-        # Start process
-        process = subprocess.Popen(
-            ['bash', script_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env_vars,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
+        # Create and start container
+        container = docker_client.containers.create(
+            image='alpine:latest',
+            command=['sh', '-c', script_content],
+            environment=env_vars,
+            detach=True,
+            mem_limit='512m',
+            nano_cpus=500000000,  # 0.5 CPU
+            network_disabled=True,
+            read_only=True,
+            tmpfs={'/tmp': 'rw,noexec,nosuid,size=100m'}
         )
         
-        logger.info(f"[EXEC] Process started with PID: {process.pid}")
+        container.start()
+        logger.info(f"[BASH] Container {container.id[:12]} started")
         
-        stdout_lines = []
-        stderr_lines = []
-        
-        def read_stdout():
-            logger.info(f"[EXEC-STDOUT] Thread started")
-            line_count = 0
-            try:
-                for line in iter(process.stdout.readline, ''):
-                    if line:
-                        line_count += 1
-                        logger.info(f"[EXEC-STDOUT] Line {line_count}: {line.strip()}")
-                        stdout_lines.append(line)
-                        
-                        # Send immediately
-                        send_websocket_log_sync(execution_id, "stdout", line)
-                        
-                logger.info(f"[EXEC-STDOUT] Thread finished, total lines: {line_count}")
-            except Exception as e:
-                logger.error(f"[EXEC-STDOUT] Error: {e}", exc_info=True)
-            finally:
-                process.stdout.close()
-        
-        def read_stderr():
-            logger.info(f"[EXEC-STDERR] Thread started")
-            try:
-                for line in iter(process.stderr.readline, ''):
-                    if line:
-                        logger.info(f"[EXEC-STDERR] {line.strip()}")
-                        stderr_lines.append(line)
-                        send_websocket_log_sync(execution_id, "stderr", line)
-                logger.info(f"[EXEC-STDERR] Thread finished")
-            except Exception as e:
-                logger.error(f"[EXEC-STDERR] Error: {e}", exc_info=True)
-            finally:
-                process.stderr.close()
-        
-        # Start reader threads
-        stdout_thread = threading.Thread(target=read_stdout, daemon=False)
-        stderr_thread = threading.Thread(target=read_stderr, daemon=False)
-        
-        stdout_thread.start()
-        stderr_thread.start()
-        
-        logger.info(f"[EXEC] Waiting for process to complete...")
+        # Stream logs in real-time
+        stdout, stderr = stream_docker_logs(container, execution_id)
         
         # Wait for completion
-        try:
-            exit_code = process.wait(timeout=timeout)
-            logger.info(f"[EXEC] Process exited with code: {exit_code}")
-        except subprocess.TimeoutExpired:
-            logger.warning(f"[EXEC] Process timed out after {timeout}s")
-            process.kill()
-            exit_code = -1
+        result = container.wait(timeout=300)
+        exit_code = result['StatusCode']
         
-        # Wait for threads
-        logger.info(f"[EXEC] Waiting for reader threads...")
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        
-        logger.info(f"[EXEC] Collected {len(stdout_lines)} stdout lines, {len(stderr_lines)} stderr lines")
-        
-        stdout = ''.join(stdout_lines)
-        stderr = ''.join(stderr_lines)
+        # Cleanup
+        container.remove(force=True)
         
         return exit_code, stdout, stderr
         
+    except docker.errors.ImageNotFound:
+        send_log(execution_id, "info", "📥 Pulling alpine:latest image...\n")
+        docker_client.images.pull('alpine:latest')
+        return execute_bash_docker(script_content, env_vars, execution_id)
     except Exception as e:
-        logger.error(f"[EXEC] Error: {e}", exc_info=True)
-        send_websocket_log_sync(execution_id, "error", f"Execution error: {str(e)}\n")
+        logger.error(f"[BASH] Error: {e}")
         return 1, "", str(e)
+
+
+def execute_python_docker(script_content: str, env_vars: dict, execution_id: int):
+    """Execute Python script in Docker with auto dependency installation"""
     
-    finally:
+    if not docker_client:
+        send_log(execution_id, "error", "❌ Docker not available\n")
+        return 1, "", "Docker not available"
+    
+    try:
+        send_log(execution_id, "info", "🐳 Starting Python container...\n")
+        
+        # Detect if script has requirements
+        has_imports = 'import ' in script_content or 'from ' in script_content
+        
+        # Create temporary directory for script
+        temp_dir = tempfile.mkdtemp()
+        script_path = os.path.join(temp_dir, 'script.py')
+        
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        
+        # Extract imports and create auto-install wrapper
+        if has_imports:
+            send_log(execution_id, "info", "📦 Auto-installing dependencies...\n")
+            
+            # Create wrapper that installs packages
+            wrapper = f"""
+import subprocess
+import sys
+
+# Try to import and install if missing
+script_content = '''
+{script_content}
+'''
+
+# Extract imports
+import re
+imports = re.findall(r'^(?:from|import)\\s+(\\w+)', script_content, re.MULTILINE)
+packages = list(set(imports))
+
+# Try to install missing packages
+for package in packages:
+    if package not in ['sys', 'os', 'time', 'datetime', 'json', 're', 'math', 'random']:
         try:
-            os.unlink(script_path)
-            logger.info(f"[EXEC] Cleaned up temp file")
-        except Exception as e:
-            logger.warning(f"[EXEC] Failed to cleanup: {e}")
+            __import__(package)
+        except ImportError:
+            print(f"Installing {{package}}...")
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', package])
+
+# Execute the actual script
+exec(script_content)
+"""
+            with open(script_path, 'w') as f:
+                f.write(wrapper)
+        
+        # Create and start container with volume mount
+        container = docker_client.containers.create(
+            image='python:3.11-alpine',
+            command=['python', '/app/script.py'],
+            environment=env_vars,
+            volumes={temp_dir: {'bind': '/app', 'mode': 'ro'}},
+            detach=True,
+            mem_limit='512m',
+            nano_cpus=500000000
+        )
+        
+        container.start()
+        logger.info(f"[PYTHON] Container {container.id[:12]} started")
+        
+        # Stream logs
+        stdout, stderr = stream_docker_logs(container, execution_id)
+        
+        # Wait for completion
+        result = container.wait(timeout=300)
+        exit_code = result['StatusCode']
+        
+        # Cleanup
+        container.remove(force=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return exit_code, stdout, stderr
+        
+    except docker.errors.ImageNotFound:
+        send_log(execution_id, "info", "📥 Pulling python:3.11-alpine image...\n")
+        docker_client.images.pull('python:3.11-alpine')
+        return execute_python_docker(script_content, env_vars, execution_id)
+    except Exception as e:
+        logger.error(f"[PYTHON] Error: {e}")
+        if 'temp_dir' in locals():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return 1, "", str(e)
+
+
+def execute_ansible_docker(script_content: str, env_vars: dict, execution_id: int):
+    """Execute Ansible playbook in Docker"""
+    
+    if not docker_client:
+        send_log(execution_id, "error", "❌ Docker not available\n")
+        return 1, "", "Docker not available"
+    
+    try:
+        send_log(execution_id, "info", "🐳 Starting Ansible container...\n")
+        
+        # Create temp directory with playbook
+        temp_dir = tempfile.mkdtemp()
+        playbook_path = os.path.join(temp_dir, 'playbook.yml')
+        
+        with open(playbook_path, 'w') as f:
+            f.write(script_content)
+        
+        # Create and start container
+        container = docker_client.containers.create(
+            image='ansible/ansible:latest',
+            command=['ansible-playbook', '/ansible/playbook.yml', '-v'],
+            environment=env_vars,
+            volumes={temp_dir: {'bind': '/ansible', 'mode': 'ro'}},
+            detach=True,
+            mem_limit='1g',
+            nano_cpus=1000000000  # 1 CPU
+        )
+        
+        container.start()
+        logger.info(f"[ANSIBLE] Container {container.id[:12]} started")
+        
+        # Stream logs
+        stdout, stderr = stream_docker_logs(container, execution_id)
+        
+        # Wait for completion
+        result = container.wait(timeout=600)
+        exit_code = result['StatusCode']
+        
+        # Cleanup
+        container.remove(force=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return exit_code, stdout, stderr
+        
+    except docker.errors.ImageNotFound:
+        send_log(execution_id, "info", "📥 Pulling ansible/ansible:latest image...\n")
+        docker_client.images.pull('ansible/ansible:latest')
+        return execute_ansible_docker(script_content, env_vars, execution_id)
+    except Exception as e:
+        logger.error(f"[ANSIBLE] Error: {e}")
+        if 'temp_dir' in locals():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return 1, "", str(e)
+
+
+def execute_terraform_docker(script_content: str, env_vars: dict, execution_id: int):
+    """Execute Terraform in Docker"""
+    
+    if not docker_client:
+        send_log(execution_id, "error", "❌ Docker not available\n")
+        return 1, "", "Docker not available"
+    
+    try:
+        send_log(execution_id, "info", "🐳 Starting Terraform container...\n")
+        
+        # Create temp directory with terraform files
+        temp_dir = tempfile.mkdtemp()
+        tf_path = os.path.join(temp_dir, 'main.tf')
+        
+        with open(tf_path, 'w') as f:
+            f.write(script_content)
+        
+        all_stdout = []
+        all_stderr = []
+        
+        # Step 1: terraform init
+        send_log(execution_id, "info", "\n🔧 Running terraform init...\n")
+        
+        init_container = docker_client.containers.create(
+            image='hashicorp/terraform:latest',
+            command=['init'],
+            environment=env_vars,
+            volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
+            working_dir='/workspace',
+            detach=True,
+            mem_limit='1g'
+        )
+        
+        init_container.start()
+        
+        # Stream init logs
+        init_stdout, init_stderr = stream_docker_logs(init_container, execution_id)
+        all_stdout.append(init_stdout)
+        all_stderr.append(init_stderr)
+        
+        init_result = init_container.wait(timeout=120)
+        init_container.remove(force=True)
+        
+        if init_result['StatusCode'] != 0:
+            send_log(execution_id, "error", "\n❌ Terraform init failed\n")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return init_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
+        
+        send_log(execution_id, "info", "\n✅ Terraform init completed\n")
+        
+        # Step 2: terraform plan
+        send_log(execution_id, "info", "\n📋 Running terraform plan...\n")
+        
+        plan_container = docker_client.containers.create(
+            image='hashicorp/terraform:latest',
+            command=['plan'],
+            environment=env_vars,
+            volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
+            working_dir='/workspace',
+            detach=True,
+            mem_limit='1g'
+        )
+        
+        plan_container.start()
+        
+        # Stream plan logs
+        plan_stdout, plan_stderr = stream_docker_logs(plan_container, execution_id)
+        all_stdout.append(plan_stdout)
+        all_stderr.append(plan_stderr)
+        
+        plan_result = plan_container.wait(timeout=600)
+        plan_container.remove(force=True)
+        
+        # Cleanup
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        if plan_result['StatusCode'] == 0:
+            send_log(execution_id, "info", "\n✅ Terraform plan completed\n")
+        
+        return plan_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
+        
+    except docker.errors.ImageNotFound:
+        send_log(execution_id, "info", "📥 Pulling hashicorp/terraform:latest image...\n")
+        docker_client.images.pull('hashicorp/terraform:latest')
+        return execute_terraform_docker(script_content, env_vars, execution_id)
+    except Exception as e:
+        logger.error(f"[TERRAFORM] Error: {e}")
+        if 'temp_dir' in locals():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return 1, "", str(e)
 
 
 @celery_app.task
 def cleanup_old_containers():
-    """Periodic task to cleanup old Docker containers"""
+    """Cleanup old Docker containers"""
+    if not docker_client:
+        return "Docker not available"
+    
     try:
-        from app.core.docker_executor import DockerExecutor
-        executor = DockerExecutor()
-        count = executor.cleanup_old_containers(max_age_hours=24)
-        return f"Cleaned up {count} old containers"
+        # Remove stopped containers
+        containers = docker_client.containers.list(all=True, filters={'status': 'exited'})
+        count = 0
+        for container in containers:
+            try:
+                container.remove()
+                count += 1
+            except:
+                pass
+        return f"Cleaned up {count} containers"
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
         return f"Cleanup failed: {str(e)}"
