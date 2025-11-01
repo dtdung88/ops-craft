@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.api.routes import scripts, executions, auth, health, websocket, admin, secrets
 from app.db.session import engine
 from app.db.base_class import Base
+from app.core.security import SecurityMiddleware, rate_limiter
 
 
 @asynccontextmanager
@@ -32,6 +33,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ADD SECURITY MIDDLEWARE
+security_middleware = SecurityMiddleware(rate_limiter)
+app.middleware("http")(security_middleware)
 
 # Include routers
 app.include_router(health.router, prefix=settings.API_V1_STR, tags=["health"])

@@ -6,8 +6,8 @@ from datetime import datetime
 from app.api.dependencies import get_db, require_operator, require_admin
 from app.models.user import User
 from app.models.secret import Secret
-from app.core.encryption import encryption_service
-from app.services.SecretService import SecretService
+from app.services.encryption_service import encryption_service
+from app.services.secret_service import SecretService
 from app.schemas.secret import SecretCreate, SecretUpdate, SecretResponse, SecretWithValue
 
 router = APIRouter()

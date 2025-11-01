@@ -4,7 +4,7 @@ from datetime import datetime
 
 from app.models.secret import Secret
 from app.models.secret_audit import SecretAuditLog
-from app.core.encryption import encryption_service
+from app.services.encryption_service import encryption_service
 
 
 class SecretService:
