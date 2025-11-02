@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { executionApi, getWebSocketUrl, Execution } from '../services/api';
 import { useWebSocket, WebSocketMessage } from '../hooks/useWebSockets';
@@ -10,10 +10,8 @@ const ExecutionList: React.FC = () => {
     const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null);
     const [liveLog, setLiveLog] = useState<string>('');
     const [autoScroll, setAutoScroll] = useState(true);
-    const [wsConnected, setWsConnected] = useState(false);
     const [showToast, setShowToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
     const logContainerRef = useRef<HTMLDivElement>(null);
-    const executionIdRef = useRef<number | null>(null);
 
     const { data: executions, isLoading, error, refetch } = useQuery({
         queryKey: ['executions'],
@@ -24,59 +22,41 @@ const ExecutionList: React.FC = () => {
         refetchInterval: 5000,
     });
 
-    // Create stable WebSocket URL using useMemo
     const wsUrl = useMemo(() => {
-        if (!selectedExecution) return null;
-        return getWebSocketUrl(selectedExecution.id);
-    }, [selectedExecution?.id]); // Only recreate when execution ID changes
-
-    // Keep track of execution ID to prevent reconnections
-    const currentExecutionIdRef = useRef<number | null>(null);
-
-    useEffect(() => {
-        if (selectedExecution && selectedExecution.id !== currentExecutionIdRef.current) {
-            currentExecutionIdRef.current = selectedExecution.id;
-
-            // Initialize log with existing output
-            const initialLog = selectedExecution.output || '';
-            setLiveLog(initialLog);
-        }
+        if (!selectedExecution?.id) return null;
+        const url = getWebSocketUrl(selectedExecution.id);
+        console.log('[ExecutionList] Creating WebSocket URL:', url);
+        return url;
     }, [selectedExecution?.id]);
 
-    // WebSocket connection
+    const handleWebSocketMessage = useCallback((message: WebSocketMessage) => {
+        console.log('[ExecutionList] WebSocket message:', message.type);
+
+        if (message.type === 'log' && message.content) {
+            setLiveLog((prev) => prev + message.content);
+        } else if (message.type === 'status' && message.status) {
+            if (selectedExecution?.id) {
+                fetchExecutionDetails(selectedExecution.id);
+            }
+            refetch();
+        }
+    }, [selectedExecution?.id, refetch]);
+
     const { isConnected } = useWebSocket(wsUrl, {
-        onMessage: (message: WebSocketMessage) => {
-            // Only process messages for current execution
-            if (currentExecutionIdRef.current !== selectedExecution?.id) {
-                return;
-            }
-
-            console.log('[WS-RECEIVED]', message.type, message.log_type);
-
-            if (message.type === 'log' && message.content) {
-                setLiveLog((prev) => prev + message.content);
-            } else if (message.type === 'status' && message.status) {
-                // Fetch updated execution details
-                fetchExecutionDetails(currentExecutionIdRef.current!);
-                refetch();
-            }
-        },
-        onOpen: () => {
-            console.log('WebSocket connected for execution:', selectedExecution?.id);
-        },
-        onClose: () => {
-            console.log('WebSocket disconnected');
-        },
-        onError: (error) => {
-            console.error('WebSocket error:', error);
-        },
+        onMessage: handleWebSocketMessage,
+        onOpen: () => console.log('[ExecutionList] WebSocket connected'),
+        onClose: () => console.log('[ExecutionList] WebSocket disconnected'),
+        onError: (error) => console.error('[ExecutionList] WebSocket error:', error),
+        reconnect: true,
+        reconnectInterval: 3000,
+        reconnectAttempts: 5,
     });
 
-    // Fetch execution details to get updated fields
     const fetchExecutionDetails = async (executionId: number) => {
         try {
             const response = await executionApi.getById(executionId);
             setSelectedExecution(response.data);
+
             if (response.data.status !== 'running') {
                 setLiveLog(response.data.output || '');
             }
@@ -85,9 +65,12 @@ const ExecutionList: React.FC = () => {
         }
     };
 
-    // Auto-refresh modal data every 2 seconds if execution is running
     useEffect(() => {
-        if (!selectedExecution || (selectedExecution.status !== 'running' && selectedExecution.status !== 'pending')) return;
+        if (!selectedExecution ||
+            (selectedExecution.status !== 'running' &&
+                selectedExecution.status !== 'pending')) {
+            return;
+        }
 
         const interval = setInterval(() => {
             fetchExecutionDetails(selectedExecution.id);
@@ -102,14 +85,33 @@ const ExecutionList: React.FC = () => {
         }
     }, [liveLog, autoScroll]);
 
-    useEffect(() => {
-        setWsConnected(isConnected);
-    }, [isConnected]);
-
-    // Toast notification helper
     const showNotification = (message: string, type: 'success' | 'error' | 'info') => {
         setShowToast({ message, type });
         setTimeout(() => setShowToast(null), 3000);
+    };
+
+    const handleViewDetails = useCallback(async (execution: Execution) => {
+        console.log('[ExecutionList] Viewing execution:', execution.id);
+        setSelectedExecution(execution);
+        setLiveLog(execution.output || '');
+        await fetchExecutionDetails(execution.id);
+    }, []);
+
+    const handleCloseModal = useCallback(() => {
+        console.log('[ExecutionList] Closing modal');
+        setSelectedExecution(null);
+        setLiveLog('');
+    }, []);
+
+    const handleCancelExecution = async (id: number) => {
+        try {
+            await executionApi.cancel(id);
+            showNotification('Execution cancelled successfully', 'success');
+            refetch();
+        } catch (error) {
+            console.error('Failed to cancel execution:', error);
+            showNotification('Failed to cancel execution', 'error');
+        }
     };
 
     if (isLoading) return <div className="loading">Loading executions...</div>;
@@ -156,40 +158,10 @@ const ExecutionList: React.FC = () => {
         return `${Math.floor(duration / 3600)}h ${Math.floor((duration % 3600) / 60)}m`;
     };
 
-    const handleViewDetails = async (execution: Execution) => {
-        setSelectedExecution(execution);
-        executionIdRef.current = execution.id;
-
-        const initialLog = execution.output || '';
-        setLiveLog(initialLog);
-
-        // Always fetch latest details
-        await fetchExecutionDetails(execution.id);
-    };
-
-    const handleCloseModal = () => {
-        setSelectedExecution(null);
-        executionIdRef.current = null;
-        setLiveLog('');
-        setWsConnected(false);
-    };
-
-    const handleCancelExecution = async (id: number) => {
-        try {
-            await executionApi.cancel(id);
-            showNotification('Execution cancelled successfully', 'success');
-            refetch();
-        } catch (error) {
-            console.error('Failed to cancel execution:', error);
-            showNotification('Failed to cancel execution', 'error');
-        }
-    };
-
     return (
         <div className="execution-list-container">
             <h2>Script Executions</h2>
 
-            {/* Toast Notification */}
             {showToast && (
                 <div className={`toast toast-${showToast.type}`}>
                     {showToast.type === 'success' && '✓ '}
@@ -261,7 +233,7 @@ const ExecutionList: React.FC = () => {
                 </table>
             )}
 
-            {/* Execution Details Modal */}
+            {/* FIXED: Complete Execution Details Modal */}
             {selectedExecution && (
                 <div className="modal-overlay" onClick={handleCloseModal}>
                     <div className="modal-details" onClick={(e) => e.stopPropagation()}>
@@ -271,6 +243,7 @@ const ExecutionList: React.FC = () => {
                         </div>
 
                         <div className="modal-details-body">
+                            {/* General Information Section */}
                             <div className="details-section">
                                 <h3>General Information</h3>
                                 <div className="details-info-grid">
@@ -296,7 +269,9 @@ const ExecutionList: React.FC = () => {
                                     </div>
                                     <div className="detail-field">
                                         <span className="detail-label">EXECUTED BY:</span>
-                                        <span className="detail-value">{selectedExecution.executed_by || user?.username || 'system'}</span>
+                                        <span className="detail-value">
+                                            {selectedExecution.executed_by || user?.username || 'system'}
+                                        </span>
                                     </div>
                                     <div className="detail-field">
                                         <span className="detail-label">CREATED AT:</span>
@@ -304,11 +279,15 @@ const ExecutionList: React.FC = () => {
                                     </div>
                                     <div className="detail-field">
                                         <span className="detail-label">STARTED AT:</span>
-                                        <span className="detail-value">{selectedExecution.started_at ? formatDate(selectedExecution.started_at) : 'Not started'}</span>
+                                        <span className="detail-value">
+                                            {selectedExecution.started_at ? formatDate(selectedExecution.started_at) : 'Not started'}
+                                        </span>
                                     </div>
                                     <div className="detail-field">
                                         <span className="detail-label">COMPLETED AT:</span>
-                                        <span className="detail-value">{selectedExecution.completed_at ? formatDate(selectedExecution.completed_at) : 'Not completed'}</span>
+                                        <span className="detail-value">
+                                            {selectedExecution.completed_at ? formatDate(selectedExecution.completed_at) : 'Not completed'}
+                                        </span>
                                     </div>
                                     <div className="detail-field">
                                         <span className="detail-label">DURATION:</span>
@@ -317,6 +296,7 @@ const ExecutionList: React.FC = () => {
                                 </div>
                             </div>
 
+                            {/* Parameters Section */}
                             {selectedExecution.parameters && Object.keys(selectedExecution.parameters).length > 0 && (
                                 <div className="details-section">
                                     <h3>Parameters</h3>
@@ -326,10 +306,11 @@ const ExecutionList: React.FC = () => {
                                 </div>
                             )}
 
+                            {/* Output Section */}
                             <div className="details-section">
                                 <div className="output-section-header">
                                     <h3>Output</h3>
-                                    {wsConnected && selectedExecution.status === 'running' && (
+                                    {isConnected && selectedExecution.status === 'running' && (
                                         <span className="live-indicator">
                                             <span className="live-dot"></span>
                                             Live
@@ -341,6 +322,7 @@ const ExecutionList: React.FC = () => {
                                 </div>
                             </div>
 
+                            {/* Error Section */}
                             {selectedExecution.error && (
                                 <div className="details-section">
                                     <h3>Error</h3>

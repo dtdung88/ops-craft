@@ -1,6 +1,5 @@
 """
-Unified Script Executor Service using Strategy Pattern
-Consolidates all Docker execution logic
+Fixed Unified Script Executor Service
 File: backend/app/services/executor_service.py
 """
 
@@ -63,16 +62,7 @@ class ExecutionStrategy(ABC):
         container, 
         log_callback: Optional[Callable[[str, str], None]]
     ) -> Tuple[str, str]:
-        """
-        Stream logs from container in real-time
-        
-        Args:
-            container: Docker container object
-            log_callback: Callback function(log_type, content)
-            
-        Returns:
-            Tuple of (stdout, stderr)
-        """
+        """Stream logs from container in real-time"""
         stdout_lines = []
         stderr_lines = []
         
@@ -85,7 +75,6 @@ class ExecutionStrategy(ABC):
             ):
                 line = log_chunk.decode('utf-8', errors='replace')
                 
-                # Simple heuristic to detect errors
                 is_error = any(
                     word in line.lower() 
                     for word in ['error', 'fail', 'exception', 'traceback', 'fatal']
@@ -120,7 +109,7 @@ class BashExecutor(ExecutionStrategy):
             image="alpine:latest",
             command_prefix=["sh", "-c"],
             memory_limit="512m",
-            nano_cpus=500_000_000,  # 0.5 CPU
+            nano_cpus=500_000_000,
             network_disabled=True,
             read_only=True
         )
@@ -136,7 +125,9 @@ class BashExecutor(ExecutionStrategy):
         """Execute bash script"""
         self._pull_image_if_needed()
         
+        container = None
         try:
+            # FIX: Remove 'remove' parameter from create()
             container = self.client.containers.create(
                 image=self.config.image,
                 command=self.config.command_prefix + [content],
@@ -147,24 +138,19 @@ class BashExecutor(ExecutionStrategy):
                 network_disabled=self.config.network_disabled,
                 read_only=self.config.read_only,
                 tmpfs={'/tmp': 'rw,noexec,nosuid,size=100m'},
-                security_opt=["no-new-privileges"],
-                remove=False
+                security_opt=["no-new-privileges"]
+                # DON'T use 'remove' here - it's for run(), not create()
             )
             
             container.start()
             logger.info(f"[BASH] Container {container.id[:12]} started")
             
-            # Stream logs in real-time
             stdout, stderr = self._stream_logs(container, log_callback)
             
-            # Wait for completion
             result = container.wait(timeout=timeout)
             exit_code = result['StatusCode']
             
             logger.info(f"[BASH] Container exited with code {exit_code}")
-            
-            # Cleanup
-            container.remove(force=True)
             
             return exit_code, stdout, stderr
             
@@ -174,6 +160,13 @@ class BashExecutor(ExecutionStrategy):
         except Exception as e:
             logger.error(f"[BASH] Execution error: {e}", exc_info=True)
             return 1, "", f"Execution error: {str(e)}"
+        finally:
+            # Cleanup container
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception as e:
+                    logger.warning(f"Failed to remove container: {e}")
 
 
 class PythonExecutor(ExecutionStrategy):
@@ -198,12 +191,11 @@ class PythonExecutor(ExecutionStrategy):
         """Execute Python script"""
         self._pull_image_if_needed()
         
-        # Create temp directory for script
         temp_dir = tempfile.mkdtemp()
         script_path = os.path.join(temp_dir, 'script.py')
+        container = None
         
         try:
-            # Write script to file
             with open(script_path, 'w') as f:
                 f.write(content)
             
@@ -215,11 +207,10 @@ class PythonExecutor(ExecutionStrategy):
                 detach=True,
                 mem_limit=self.config.memory_limit,
                 nano_cpus=self.config.nano_cpus,
-                network_disabled=False,  # Python may need pip
+                network_disabled=False,
                 read_only=True,
                 tmpfs={'/tmp': 'rw,noexec,nosuid,size=100m'},
-                security_opt=["no-new-privileges"],
-                remove=False
+                security_opt=["no-new-privileges"]
             )
             
             container.start()
@@ -232,14 +223,17 @@ class PythonExecutor(ExecutionStrategy):
             
             logger.info(f"[PYTHON] Container exited with code {exit_code}")
             
-            container.remove(force=True)
-            
             return exit_code, stdout, stderr
             
         except Exception as e:
             logger.error(f"[PYTHON] Execution error: {e}", exc_info=True)
             return 1, "", f"Execution error: {str(e)}"
         finally:
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception as e:
+                    logger.warning(f"Failed to remove container: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -251,8 +245,8 @@ class AnsibleExecutor(ExecutionStrategy):
             image="ansible/ansible:latest",
             command_prefix=["ansible-playbook"],
             memory_limit="1g",
-            nano_cpus=1_000_000_000,  # 1 CPU
-            network_disabled=False,  # Ansible needs network
+            nano_cpus=1_000_000_000,
+            network_disabled=False,
             read_only=False
         )
         super().__init__(docker_client, config)
@@ -269,6 +263,7 @@ class AnsibleExecutor(ExecutionStrategy):
         
         temp_dir = tempfile.mkdtemp()
         playbook_path = os.path.join(temp_dir, 'playbook.yml')
+        container = None
         
         try:
             with open(playbook_path, 'w') as f:
@@ -283,8 +278,7 @@ class AnsibleExecutor(ExecutionStrategy):
                 mem_limit=self.config.memory_limit,
                 nano_cpus=self.config.nano_cpus,
                 network_disabled=self.config.network_disabled,
-                security_opt=["no-new-privileges"],
-                remove=False
+                security_opt=["no-new-privileges"]
             )
             
             container.start()
@@ -297,14 +291,17 @@ class AnsibleExecutor(ExecutionStrategy):
             
             logger.info(f"[ANSIBLE] Container exited with code {exit_code}")
             
-            container.remove(force=True)
-            
             return exit_code, stdout, stderr
             
         except Exception as e:
             logger.error(f"[ANSIBLE] Execution error: {e}", exc_info=True)
             return 1, "", f"Execution error: {str(e)}"
         finally:
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception as e:
+                    logger.warning(f"Failed to remove container: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -346,66 +343,78 @@ class TerraformExecutor(ExecutionStrategy):
             if log_callback:
                 log_callback("info", "\n🔧 Running terraform init...\n")
             
-            init_container = self.client.containers.create(
-                image=self.config.image,
-                command=['init'],
-                environment=env_vars,
-                volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
-                working_dir='/workspace',
-                detach=True,
-                mem_limit=self.config.memory_limit,
-                nano_cpus=self.config.nano_cpus,
-                remove=False
-            )
-            
-            init_container.start()
-            logger.info(f"[TERRAFORM] Init container {init_container.id[:12]} started")
-            
-            init_stdout, init_stderr = self._stream_logs(init_container, log_callback)
-            all_stdout.append(init_stdout)
-            all_stderr.append(init_stderr)
-            
-            init_result = init_container.wait(timeout=120)
-            init_container.remove(force=True)
-            
-            if init_result['StatusCode'] != 0:
+            init_container = None
+            try:
+                init_container = self.client.containers.create(
+                    image=self.config.image,
+                    command=['init'],
+                    environment=env_vars,
+                    volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
+                    working_dir='/workspace',
+                    detach=True,
+                    mem_limit=self.config.memory_limit,
+                    nano_cpus=self.config.nano_cpus
+                )
+                
+                init_container.start()
+                logger.info(f"[TERRAFORM] Init container {init_container.id[:12]} started")
+                
+                init_stdout, init_stderr = self._stream_logs(init_container, log_callback)
+                all_stdout.append(init_stdout)
+                all_stderr.append(init_stderr)
+                
+                init_result = init_container.wait(timeout=120)
+                
+                if init_result['StatusCode'] != 0:
+                    if log_callback:
+                        log_callback("error", "\n❌ Terraform init failed\n")
+                    return init_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
+                
                 if log_callback:
-                    log_callback("error", "\n❌ Terraform init failed\n")
-                return init_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
-            
-            if log_callback:
-                log_callback("info", "\n✅ Terraform init completed\n")
+                    log_callback("info", "\n✅ Terraform init completed\n")
+            finally:
+                if init_container:
+                    try:
+                        init_container.remove(force=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove init container: {e}")
             
             # Step 2: terraform plan
             if log_callback:
                 log_callback("info", "\n📋 Running terraform plan...\n")
             
-            plan_container = self.client.containers.create(
-                image=self.config.image,
-                command=['plan'],
-                environment=env_vars,
-                volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
-                working_dir='/workspace',
-                detach=True,
-                mem_limit=self.config.memory_limit,
-                nano_cpus=self.config.nano_cpus,
-                remove=False
-            )
-            
-            plan_container.start()
-            logger.info(f"[TERRAFORM] Plan container {plan_container.id[:12]} started")
-            
-            plan_stdout, plan_stderr = self._stream_logs(plan_container, log_callback)
-            all_stdout.append(plan_stdout)
-            all_stderr.append(plan_stderr)
-            
-            plan_result = plan_container.wait(timeout=timeout)
-            plan_container.remove(force=True)
-            
-            if plan_result['StatusCode'] == 0 and log_callback:
-                log_callback("info", "\n✅ Terraform plan completed\n")
-            
-            return plan_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
+            plan_container = None
+            try:
+                plan_container = self.client.containers.create(
+                    image=self.config.image,
+                    command=['plan'],
+                    environment=env_vars,
+                    volumes={temp_dir: {'bind': '/workspace', 'mode': 'rw'}},
+                    working_dir='/workspace',
+                    detach=True,
+                    mem_limit=self.config.memory_limit,
+                    nano_cpus=self.config.nano_cpus
+                )
+                
+                plan_container.start()
+                logger.info(f"[TERRAFORM] Plan container {plan_container.id[:12]} started")
+                
+                plan_stdout, plan_stderr = self._stream_logs(plan_container, log_callback)
+                all_stdout.append(plan_stdout)
+                all_stderr.append(plan_stderr)
+                
+                plan_result = plan_container.wait(timeout=timeout)
+                
+                if plan_result['StatusCode'] == 0 and log_callback:
+                    log_callback("info", "\n✅ Terraform plan completed\n")
+                
+                return plan_result['StatusCode'], ''.join(all_stdout), ''.join(all_stderr)
+            finally:
+                if plan_container:
+                    try:
+                        plan_container.remove(force=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove plan container: {e}")
             
         except Exception as e:
             logger.error(f"[TERRAFORM] Execution error: {e}", exc_info=True)
@@ -417,18 +426,12 @@ class TerraformExecutor(ExecutionStrategy):
 class ExecutorService:
     """
     Unified executor service using strategy pattern
-    Manages all script execution through Docker
     """
     
     def __init__(self):
         """Initialize executor service and Docker client"""
-        try:
-            self.docker_client = docker.from_env()
-            self.docker_client.ping()
-            logger.info("[EXECUTOR] Docker connected successfully")
-        except Exception as e:
-            logger.error(f"[EXECUTOR] Docker connection failed: {e}")
-            self.docker_client = None
+        self.docker_client = None
+        self._init_docker_client()
         
         # Executor strategies for each script type
         self._executors = {
@@ -438,6 +441,19 @@ class ExecutorService:
             ScriptType.TERRAFORM: TerraformExecutor,
         }
     
+    def _init_docker_client(self):
+        """Initialize Docker client with error handling"""
+        try:
+            self.docker_client = docker.from_env()
+            self.docker_client.ping()
+            logger.info("[EXECUTOR] Docker connected successfully")
+        except docker.errors.DockerException as e:
+            logger.error(f"[EXECUTOR] Docker connection failed: {e}")
+            self.docker_client = None
+        except Exception as e:
+            logger.error(f"[EXECUTOR] Unexpected error connecting to Docker: {e}")
+            self.docker_client = None
+    
     def execute(
         self,
         script_type: ScriptType,
@@ -446,19 +462,7 @@ class ExecutorService:
         timeout: int = 300,
         log_callback: Optional[Callable[[str, str], None]] = None
     ) -> Tuple[int, str, str]:
-        """
-        Execute script with appropriate executor
-        
-        Args:
-            script_type: Type of script to execute
-            content: Script content
-            env_vars: Environment variables
-            timeout: Execution timeout in seconds
-            log_callback: Optional callback for real-time logs (log_type, content)
-            
-        Returns:
-            Tuple of (exit_code, stdout, stderr)
-        """
+        """Execute script with appropriate executor"""
         if not self.docker_client:
             error_msg = "Docker is not available"
             logger.error(f"[EXECUTOR] {error_msg}")
@@ -481,42 +485,6 @@ class ExecutorService:
         except Exception as e:
             logger.error(f"[EXECUTOR] Fatal error during execution: {e}", exc_info=True)
             return 1, "", f"Fatal execution error: {str(e)}"
-    
-    def cleanup_old_containers(self, max_age_hours: int = 24) -> int:
-        """
-        Cleanup old exited containers
-        
-        Args:
-            max_age_hours: Remove containers older than this
-            
-        Returns:
-            Number of containers removed
-        """
-        if not self.docker_client:
-            logger.warning("[EXECUTOR] Docker not available for cleanup")
-            return 0
-        
-        try:
-            containers = self.docker_client.containers.list(
-                all=True,
-                filters={'status': 'exited'}
-            )
-            
-            count = 0
-            for container in containers:
-                try:
-                    # TODO: Add age filtering based on container.attrs['Created']
-                    container.remove()
-                    count += 1
-                except Exception as e:
-                    logger.warning(f"Failed to remove container {container.id[:12]}: {e}")
-            
-            logger.info(f"[EXECUTOR] Cleaned up {count} old containers")
-            return count
-            
-        except Exception as e:
-            logger.error(f"[EXECUTOR] Cleanup error: {e}")
-            return 0
     
     def is_available(self) -> bool:
         """Check if Docker is available"""

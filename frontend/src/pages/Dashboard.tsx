@@ -1,7 +1,7 @@
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
-import { scriptApi, executionApi, Script, Execution } from '../services/api';
+import { scriptApi, executionApi } from '../services/api';
 import '../styles/Dashboard.css';
 
 const Dashboard: React.FC = () => {

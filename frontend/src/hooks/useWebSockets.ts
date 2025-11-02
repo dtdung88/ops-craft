@@ -38,12 +38,16 @@ export const useWebSocket = (
 
     const [isConnected, setIsConnected] = useState(false);
     const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null);
+
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectCountRef = useRef(0);
     const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
     const heartbeatTimeoutRef = useRef<NodeJS.Timeout>();
     const shouldReconnectRef = useRef(true);
     const mountedRef = useRef(true);
+
+    // FIX: Store URL in ref to prevent reconnections on re-render
+    const urlRef = useRef<string | null>(null);
 
     const cleanup = useCallback(() => {
         if (reconnectTimeoutRef.current) {
@@ -53,7 +57,16 @@ export const useWebSocket = (
             clearTimeout(heartbeatTimeoutRef.current);
         }
         if (wsRef.current) {
-            wsRef.current.close();
+            // Remove event listeners before closing
+            wsRef.current.onopen = null;
+            wsRef.current.onmessage = null;
+            wsRef.current.onerror = null;
+            wsRef.current.onclose = null;
+
+            if (wsRef.current.readyState === WebSocket.OPEN ||
+                wsRef.current.readyState === WebSocket.CONNECTING) {
+                wsRef.current.close(1000, 'Component unmounting');
+            }
             wsRef.current = null;
         }
         setIsConnected(false);
@@ -66,18 +79,35 @@ export const useWebSocket = (
 
         heartbeatTimeoutRef.current = setTimeout(() => {
             if (wsRef.current?.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ type: 'ping' }));
-                startHeartbeat();
+                try {
+                    wsRef.current.send(JSON.stringify({ type: 'ping' }));
+                    startHeartbeat();
+                } catch (error) {
+                    console.error('[WS] Heartbeat send failed:', error);
+                }
             }
         }, heartbeatInterval);
     }, [heartbeatInterval]);
 
     const connect = useCallback(() => {
+        // FIX: Don't reconnect if URL hasn't changed and connection exists
         if (!url || !mountedRef.current) return;
+
+        // Prevent duplicate connections
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            console.log('[WS] Already connected, skipping');
+            return;
+        }
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING) {
+            console.log('[WS] Connection in progress, skipping');
+            return;
+        }
 
         cleanup();
 
         try {
+            console.log('[WS] Connecting to:', url);
             const ws = new WebSocket(url);
             wsRef.current = ws;
 
@@ -87,6 +117,7 @@ export const useWebSocket = (
                     return;
                 }
 
+                console.log('[WS] Connected successfully');
                 setIsConnected(true);
                 reconnectCountRef.current = 0;
                 onOpen?.();
@@ -100,20 +131,19 @@ export const useWebSocket = (
                     const message: WebSocketMessage = JSON.parse(event.data);
                     setLastMessage(message);
                     onMessage?.(message);
-
-                    // Reset heartbeat on message
-                    startHeartbeat();
+                    startHeartbeat(); // Reset heartbeat on message
                 } catch (error) {
-                    console.error('Failed to parse WebSocket message:', error);
+                    console.error('[WS] Failed to parse message:', error);
                 }
             };
 
             ws.onerror = (event) => {
-                console.error('WebSocket error:', event);
+                console.error('[WS] Error:', event);
                 onError?.(event);
             };
 
             ws.onclose = (event) => {
+                console.log('[WS] Closed:', event.code, event.reason);
                 setIsConnected(false);
                 wsRef.current = null;
                 onClose?.();
@@ -122,16 +152,17 @@ export const useWebSocket = (
                     clearTimeout(heartbeatTimeoutRef.current);
                 }
 
+                // Only reconnect if intentional disconnect
                 if (
                     mountedRef.current &&
                     shouldReconnectRef.current &&
                     reconnectCountRef.current < reconnectAttempts &&
                     reconnect &&
-                    event.code !== 1000
+                    event.code !== 1000 // Normal closure
                 ) {
                     reconnectCountRef.current++;
                     console.log(
-                        `Reconnecting... Attempt ${reconnectCountRef.current}/${reconnectAttempts}`
+                        `[WS] Reconnecting... Attempt ${reconnectCountRef.current}/${reconnectAttempts}`
                     );
 
                     reconnectTimeoutRef.current = setTimeout(() => {
@@ -142,12 +173,13 @@ export const useWebSocket = (
                 }
             };
         } catch (error) {
-            console.error('Failed to create WebSocket:', error);
+            console.error('[WS] Failed to create WebSocket:', error);
         }
     }, [url, onOpen, onMessage, onClose, onError, reconnect, reconnectInterval,
         reconnectAttempts, cleanup, startHeartbeat]);
 
     const disconnect = useCallback(() => {
+        console.log('[WS] Manual disconnect requested');
         shouldReconnectRef.current = false;
         reconnectCountRef.current = reconnectAttempts;
         cleanup();
@@ -159,27 +191,38 @@ export const useWebSocket = (
                 wsRef.current.send(JSON.stringify(message));
                 return true;
             } catch (error) {
-                console.error('Failed to send WebSocket message:', error);
+                console.error('[WS] Failed to send message:', error);
                 return false;
             }
         }
+        console.warn('[WS] Cannot send message, not connected');
         return false;
     }, []);
 
+    // FIX: Only connect when URL actually changes
     useEffect(() => {
         mountedRef.current = true;
         shouldReconnectRef.current = true;
 
-        if (url) {
+        // Only connect if URL changed
+        if (url && url !== urlRef.current) {
+            console.log('[WS] URL changed, connecting...');
+            urlRef.current = url;
             connect();
+        } else if (!url && urlRef.current) {
+            console.log('[WS] URL removed, disconnecting...');
+            urlRef.current = null;
+            cleanup();
         }
 
         return () => {
+            console.log('[WS] Component unmounting, cleanup');
             mountedRef.current = false;
             shouldReconnectRef.current = false;
+            urlRef.current = null;
             cleanup();
         };
-    }, [url, connect, cleanup]);
+    }, [url]); // Only depend on url
 
     return {
         isConnected,

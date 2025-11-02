@@ -1,9 +1,9 @@
 """
-Enhanced Encryption Service with Dynamic Salts and Key Rotation
-File: backend/app/core/encryption.py
+Enhanced Encryption Service with Backward Compatibility
+File: backend/app/services/encryption_service.py
 """
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
@@ -19,35 +19,36 @@ logger = logging.getLogger(__name__)
 
 class EncryptionService:
     """
-    Enhanced encryption service with:
-    - Dynamic salt generation per encryption
-    - PBKDF2 key derivation
-    - Key rotation support
-    - Secure defaults
+    Enhanced encryption service with backward compatibility
+    - Supports both legacy (fixed salt) and new (dynamic salt) formats
+    - Automatically detects and handles both formats
     """
     
+    # Legacy fixed salt for backward compatibility
+    LEGACY_SALT = b'devops_script_manager_salt_v1'
+    LEGACY_SALT_LENGTH = len(LEGACY_SALT)
+    
     def __init__(self, master_key: Optional[str] = None):
-        """
-        Initialize encryption service
-        
-        Args:
-            master_key: Master key for encryption (defaults to settings.SECRET_KEY)
-        """
         self.master_key = master_key or settings.SECRET_KEY
         self._key_cache = {}
+        
+        # Initialize legacy cipher for backward compatibility
+        self._legacy_cipher = self._create_legacy_cipher()
+    
+    def _create_legacy_cipher(self) -> Fernet:
+        """Create cipher using legacy fixed salt"""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.LEGACY_SALT,
+            iterations=100000,
+            backend=default_backend()
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(self.master_key.encode()))
+        return Fernet(key)
     
     def _derive_key(self, salt: bytes, iterations: int = 100000) -> bytes:
-        """
-        Derive encryption key from master key using PBKDF2
-        
-        Args:
-            salt: Salt for key derivation (16 bytes)
-            iterations: Number of PBKDF2 iterations
-            
-        Returns:
-            Derived key (32 bytes, URL-safe base64 encoded)
-        """
-        # Check cache first (for performance)
+        """Derive encryption key from master key using PBKDF2"""
         cache_key = base64.b64encode(salt).decode()
         if cache_key in self._key_cache:
             return self._key_cache[cache_key]
@@ -62,31 +63,34 @@ class EncryptionService:
         
         key = base64.urlsafe_b64encode(kdf.derive(self.master_key.encode()))
         
-        # Cache the derived key (limit cache size)
         if len(self._key_cache) < 100:
             self._key_cache[cache_key] = key
         
         return key
     
+    def _is_new_format(self, ciphertext: str) -> bool:
+        """
+        Detect if ciphertext uses new format (with embedded salt)
+        New format: [16 bytes salt][encrypted data]
+        Must be at least 16 bytes + minimum Fernet token size
+        """
+        try:
+            combined = base64.urlsafe_b64decode(ciphertext.encode())
+            # New format must be at least 16 (salt) + 57 (min Fernet token)
+            return len(combined) >= 73
+        except Exception:
+            return False
+    
     def encrypt(self, plaintext: str) -> str:
         """
-        Encrypt plaintext with a random salt
-        
-        The encrypted data format is:
-        [16 bytes salt][encrypted data]
-        All base64 encoded
-        
-        Args:
-            plaintext: Data to encrypt
-            
-        Returns:
-            Base64 encoded encrypted data with embedded salt
+        Encrypt plaintext with a random salt (NEW FORMAT)
+        Format: [16 bytes salt][encrypted data] (base64 encoded)
         """
         if not plaintext:
             return ""
         
         try:
-            # Generate random salt (16 bytes = 128 bits)
+            # Generate random salt
             salt = secrets.token_bytes(16)
             
             # Derive key from salt
@@ -108,80 +112,71 @@ class EncryptionService:
     
     def decrypt(self, ciphertext: str) -> str:
         """
-        Decrypt ciphertext with embedded salt
-        
-        Args:
-            ciphertext: Base64 encoded encrypted data with salt
-            
-        Returns:
-            Decrypted plaintext
+        Decrypt ciphertext with automatic format detection
+        Supports both legacy (fixed salt) and new (dynamic salt) formats
         """
         if not ciphertext:
             return ""
         
         try:
-            # Decode from base64
-            combined = base64.urlsafe_b64decode(ciphertext.encode())
+            # Try new format first
+            if self._is_new_format(ciphertext):
+                try:
+                    return self._decrypt_new_format(ciphertext)
+                except Exception as e:
+                    logger.warning(f"New format decryption failed, trying legacy: {e}")
             
-            # Extract salt (first 16 bytes) and encrypted data
-            salt = combined[:16]
-            encrypted = combined[16:]
-            
-            # Derive key from salt
-            key = self._derive_key(salt)
-            cipher = Fernet(key)
-            
-            # Decrypt
-            decrypted = cipher.decrypt(encrypted)
-            return decrypted.decode()
+            # Fallback to legacy format
+            return self._decrypt_legacy_format(ciphertext)
             
         except Exception as e:
-            logger.error(f"Decryption failed: {e}")
+            logger.error(f"Decryption failed for both formats: {e}")
             raise ValueError(f"Decryption failed: {str(e)}")
     
-    def rotate_key(
-        self, 
-        old_ciphertext: str, 
-        new_master_key: str,
-        old_master_key: Optional[str] = None
-    ) -> str:
-        """
-        Rotate encryption key for a value
+    def _decrypt_new_format(self, ciphertext: str) -> str:
+        """Decrypt new format (dynamic salt)"""
+        # Decode from base64
+        combined = base64.urlsafe_b64decode(ciphertext.encode())
         
-        Args:
-            old_ciphertext: Currently encrypted data
-            new_master_key: New master key to use
-            old_master_key: Old master key (defaults to current)
-            
-        Returns:
-            Re-encrypted data with new key
+        # Extract salt (first 16 bytes) and encrypted data
+        salt = combined[:16]
+        encrypted = combined[16:]
+        
+        # Derive key from salt
+        key = self._derive_key(salt)
+        cipher = Fernet(key)
+        
+        # Decrypt
+        decrypted = cipher.decrypt(encrypted)
+        return decrypted.decode()
+    
+    def _decrypt_legacy_format(self, ciphertext: str) -> str:
+        """Decrypt legacy format (fixed salt)"""
+        encrypted = base64.urlsafe_b64decode(ciphertext.encode())
+        decrypted = self._legacy_cipher.decrypt(encrypted)
+        return decrypted.decode()
+    
+    def migrate_to_new_format(self, old_ciphertext: str) -> str:
+        """
+        Migrate legacy encrypted data to new format
+        This should be called during a migration script
         """
         try:
-            # Decrypt with old key
-            old_service = EncryptionService(old_master_key or self.master_key)
-            plaintext = old_service.decrypt(old_ciphertext)
+            # Decrypt using automatic detection
+            plaintext = self.decrypt(old_ciphertext)
             
-            # Encrypt with new key
-            new_service = EncryptionService(new_master_key)
-            new_ciphertext = new_service.encrypt(plaintext)
+            # Re-encrypt using new format
+            new_ciphertext = self.encrypt(plaintext)
             
-            logger.info("Key rotation successful")
+            logger.info("Successfully migrated to new encryption format")
             return new_ciphertext
             
         except Exception as e:
-            logger.error(f"Key rotation failed: {e}")
-            raise ValueError(f"Key rotation failed: {str(e)}")
+            logger.error(f"Migration failed: {e}")
+            raise ValueError(f"Failed to migrate encryption: {str(e)}")
     
     def verify_encryption(self, ciphertext: str) -> bool:
-        """
-        Verify that ciphertext can be decrypted
-        
-        Args:
-            ciphertext: Encrypted data to verify
-            
-        Returns:
-            True if valid and decryptable
-        """
+        """Verify that ciphertext can be decrypted"""
         try:
             self.decrypt(ciphertext)
             return True
@@ -192,73 +187,6 @@ class EncryptionService:
         """Clear the key derivation cache"""
         self._key_cache.clear()
         logger.debug("Encryption key cache cleared")
-
-
-class LegacyEncryptionService:
-    """
-    Legacy encryption service for backward compatibility
-    Uses fixed salt (for data encrypted with old method)
-    
-    Only use this for migrating old data!
-    """
-    
-    def __init__(self, master_key: Optional[str] = None):
-        self.master_key = master_key or settings.SECRET_KEY
-        # Fixed salt from original implementation
-        self.fixed_salt = b'devops_script_manager_salt_v1'
-        self.key = self._derive_key()
-        self.cipher = Fernet(self.key)
-    
-    def _derive_key(self) -> bytes:
-        """Derive key using fixed salt (legacy method)"""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=self.fixed_salt,
-            iterations=100000,
-            backend=default_backend()
-        )
-        key = base64.urlsafe_b64encode(kdf.derive(self.master_key.encode()))
-        return key
-    
-    def decrypt(self, ciphertext: str) -> str:
-        """Decrypt using legacy method"""
-        if not ciphertext:
-            return ""
-        
-        try:
-            encrypted = base64.urlsafe_b64decode(ciphertext.encode())
-            decrypted = self.cipher.decrypt(encrypted)
-            return decrypted.decode()
-        except Exception as e:
-            raise ValueError(f"Legacy decryption failed: {str(e)}")
-
-
-def migrate_legacy_encryption(old_ciphertext: str) -> str:
-    """
-    Migrate data from legacy encryption to new format
-    
-    Args:
-        old_ciphertext: Data encrypted with legacy method
-        
-    Returns:
-        Data re-encrypted with new method
-    """
-    try:
-        # Decrypt using legacy method
-        legacy_service = LegacyEncryptionService()
-        plaintext = legacy_service.decrypt(old_ciphertext)
-        
-        # Re-encrypt using new method
-        new_service = EncryptionService()
-        new_ciphertext = new_service.encrypt(plaintext)
-        
-        logger.info("Successfully migrated legacy encrypted data")
-        return new_ciphertext
-        
-    except Exception as e:
-        logger.error(f"Migration failed: {e}")
-        raise ValueError(f"Failed to migrate legacy encryption: {str(e)}")
 
 
 # Global encryption service instance
